@@ -1,7 +1,9 @@
 package imap
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -10,7 +12,6 @@ import (
 	imapClient "github.com/emersion/go-imap/client"
 
 	"github.com/Necoro/feed2imap-go/pkg/log"
-	"github.com/Necoro/feed2imap-go/pkg/util"
 )
 
 type client struct {
@@ -124,7 +125,7 @@ func (conn *connection) ensureFolder(folder Folder) error {
 	}
 
 	switch {
-	case found == 0 || (found == 1 && util.StrContains(mbox.Attributes, imap.NoSelectAttr)):
+	case found == 0 || (found == 1 && slices.Contains(mbox.Attributes, imap.NoSelectAttr)):
 		return conn.createFolder(folder.str)
 	case found == 1:
 		conn.mailboxes.add(mbox)
@@ -136,7 +137,7 @@ func (conn *connection) ensureFolder(folder Folder) error {
 
 func (conn *connection) delete(uids []uint32) error {
 	storeItem := imap.FormatFlagsOp(imap.AddFlags, true)
-	deleteFlag := []interface{}{imap.DeletedFlag}
+	deleteFlag := []any{imap.DeletedFlag}
 
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uids...)
@@ -165,18 +166,29 @@ func (conn *connection) fetchFlags(uid uint32) ([]string, error) {
 	seqSet.AddNum(uid)
 
 	messages := make(chan *imap.Message, 1)
-	done := make(chan error, 1)
+	done := make(chan error)
 	go func() {
 		done <- conn.c.UidFetch(seqSet, fetchItem, messages)
 	}()
 
-	msg := <-messages
+	var flags []string
+	for m := range messages {
+		// unilateral flags messages may be sent by the server, which then clutter our messages
+		// --> filter for our selected UID
+		if m.Uid == uid {
+			flags = m.Flags
+		}
+	}
 	err := <-done
 
-	if err != nil {
-		return nil, fmt.Errorf("fetching flags: %w", err)
+	if err == nil && flags == nil {
+		err = errors.New("no flags returned")
 	}
-	return msg.Flags, nil
+
+	if err != nil {
+		return nil, fmt.Errorf("fetching flags for UID %d: %w", uid, err)
+	}
+	return flags, nil
 }
 
 func (conn *connection) replace(folder Folder, header, value, newContent string, force bool) error {
@@ -225,6 +237,7 @@ func (conn *connection) replace(folder Folder, header, value, newContent string,
 func (conn *connection) searchHeader(header, value string) ([]uint32, error) {
 	criteria := imap.NewSearchCriteria()
 	criteria.Header.Set(header, value)
+	criteria.WithoutFlags = []string{imap.DeletedFlag}
 	ids, err := conn.search(criteria)
 	if err != nil {
 		return nil, fmt.Errorf("searching for header %q=%q: %w", header, value, err)

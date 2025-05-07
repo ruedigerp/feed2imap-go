@@ -3,10 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
 
-	"github.com/Necoro/feed2imap-go/internal/feed"
+	"github.com/Necoro/feed2imap-go/internal/feed/cache"
+	"github.com/Necoro/feed2imap-go/internal/feed/template"
 	"github.com/Necoro/feed2imap-go/internal/imap"
 	"github.com/Necoro/feed2imap-go/pkg/config"
 	"github.com/Necoro/feed2imap-go/pkg/log"
@@ -16,17 +16,17 @@ import (
 // flags
 var (
 	cfgFile      string = "config.yml"
-	cacheFile    string = "feed.cache"
-	printVersion bool   = false
-	dryRun       bool   = false
-	buildCache   bool   = false
-	verbose      bool   = false
-	debug        bool   = false
+	cacheFile    string
+	printVersion bool = false
+	dryRun       bool = false
+	buildCache   bool = false
+	verbose      bool = false
+	debug        bool = false
 )
 
 func init() {
 	flag.StringVar(&cfgFile, "f", cfgFile, "configuration file")
-	flag.StringVar(&cacheFile, "c", cacheFile, "cache file")
+	flag.StringVar(&cacheFile, "c", "", "override cache file location")
 	flag.BoolVar(&printVersion, "version", printVersion, "print version and exit")
 	flag.BoolVar(&dryRun, "dry-run", dryRun, "do everything short of uploading and writing the cache")
 	flag.BoolVar(&buildCache, "build-cache", buildCache, "only (re)build the cache; useful after migration or when the cache is lost or corrupted")
@@ -34,7 +34,8 @@ func init() {
 	flag.BoolVar(&debug, "d", debug, "enable debug output")
 }
 
-func processFeed(feed *feed.Feed, client *imap.Client, dryRun bool) {
+func processFeed(cf cache.CachedFeed, client *imap.Client, dryRun bool) {
+	feed := cf.Feed()
 	msgs, err := feed.Messages()
 	if err != nil {
 		log.Errorf("Processing items of feed %s: %s", feed.Name, err)
@@ -42,7 +43,7 @@ func processFeed(feed *feed.Feed, client *imap.Client, dryRun bool) {
 	}
 
 	if dryRun || len(msgs) == 0 {
-		feed.MarkSuccess()
+		cf.Commit()
 		return
 	}
 
@@ -59,7 +60,19 @@ func processFeed(feed *feed.Feed, client *imap.Client, dryRun bool) {
 
 	log.Printf("Uploaded %d messages to '%s' @ %s", len(msgs), feed.Name, folder)
 
-	feed.MarkSuccess()
+	cf.Commit()
+}
+
+func loadTemplate(path string, tpl template.Template) error {
+	if path == "" {
+		return nil
+	}
+
+	log.Printf("Loading custom %s template from %s", tpl.Name(), path)
+	if err := tpl.LoadFile(path); err != nil {
+		return fmt.Errorf("loading %s template from %s: %w", tpl.Name(), path, err)
+	}
+	return nil
 }
 
 func run() error {
@@ -82,16 +95,22 @@ func run() error {
 		return err
 	}
 
-	if err = cfg.Validate(); err != nil {
-		return fmt.Errorf("Configuration invalid: %w", err)
-	}
-
-	state := feed.NewState(cfg)
-
-	err = state.LoadCache(cacheFile, buildCache)
+	state, err := cache.NewState(cfg)
 	if err != nil {
 		return err
 	}
+
+	cacheLocation := cacheFile
+	if cacheLocation == "" {
+		cacheLocation = cfg.Cache
+	}
+	log.Debugf("Using '%s' as cache location", cacheLocation)
+
+	err = state.LoadCache(cacheLocation, buildCache)
+	if err != nil {
+		return err
+	}
+	defer state.UnlockCache()
 
 	state.RemoveUndue()
 
@@ -101,36 +120,51 @@ func run() error {
 		return nil
 	}
 
+	if !buildCache {
+		if err = loadTemplate(cfg.HtmlTemplate, template.Html); err != nil {
+			return err
+		}
+		if err = loadTemplate(cfg.TextTemplate, template.Text); err != nil {
+			return err
+		}
+	}
+
+	imapErr := make(chan error, 1)
+	var c *imap.Client
+	if !dryRun && !buildCache {
+		go func() {
+			var err error
+			c, err = imap.Connect(cfg.Target, cfg.MaxConns)
+			imapErr <- err
+		}()
+
+		defer func() {
+			// capture c and not evaluate it, before connect has run
+			c.Disconnect()
+		}()
+	}
+
 	if success := state.Fetch(); success == 0 {
 		return fmt.Errorf("No successful feed fetch.")
 	}
 
 	state.Filter()
 
-	imapUrl, err := url.Parse(cfg.Target)
-	if err != nil {
-		return fmt.Errorf("parsing 'target': %w", err)
-	}
-
-	var c *imap.Client
-	if !dryRun && !buildCache {
-		if c, err = imap.Connect(imapUrl); err != nil {
-			return err
-		}
-
-		defer c.Disconnect()
-	}
-
 	if buildCache {
-		state.Foreach((*feed.Feed).MarkSuccess)
+		state.Foreach(cache.CachedFeed.Commit)
 	} else {
-		state.ForeachGo(func(f *feed.Feed) {
+		if !dryRun {
+			if err = <-imapErr; err != nil {
+				return err
+			}
+		}
+		state.ForeachGo(func(f cache.CachedFeed) {
 			processFeed(f, c, dryRun)
 		})
 	}
 
 	if !dryRun {
-		if err = state.StoreCache(cacheFile); err != nil {
+		if err = state.StoreCache(cacheLocation); err != nil {
 			return err
 		}
 	}

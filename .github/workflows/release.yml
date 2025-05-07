@@ -11,32 +11,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-    - name: Set up Go 1.14
-      uses: actions/setup-go@v1
-      with:
-        go-version: 1.14
-      id: go
-
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Get version from tag
+      uses: little-core-labs/get-git-tag@v3.0.2
+      id: tag_name
+      with:
+          tagRegex: "v(.*)"
 
     - name: Get Changelog Entry
       id: changelog_reader
-      uses: mindsers/changelog-reader-action@v1.1.0
+      uses: mindsers/changelog-reader-action@v2
       with:
-        version: ${{ github.ref }}
+        version: ${{ steps.tag_name.outputs.tag }}
         path: ./CHANGELOG.md
 
     - name: Safe Changelog Text
+      id: changelog_text
       run: |
-          echo '${{ steps.changelog_reader.outputs.log_entry }}' >> $HOME/changelog_entry
-          echo "::set-env name=clfile::${HOME}/changelog_entry"
+          echo '${{ steps.changelog_reader.outputs.changes }}' >> $HOME/changelog_entry
+          echo ::set-output name=clfile::$HOME/changelog_entry
+
+    - name: Docker Login
+      uses: azure/docker-login@v2
+      with:
+         login-server: 'docker.pkg.github.com'
+         username: ${{ github.repository_owner }}
+         password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Docker Login
+      uses: azure/docker-login@v2
+      with:
+         login-server: 'https://index.docker.io/v1/'
+         username: ${{ secrets.DOCKER_USERNAME }}
+         password: ${{ secrets.DOCKER_TOKEN }}
 
     - name: Run GoReleaser
-      uses: goreleaser/goreleaser-action@v1
+      uses: goreleaser/goreleaser-action@v6
       with:
           version: latest
-          args: --release-notes ${{ env.clfile }}
+          args: --release-notes ${{ steps.changelog_text.outputs.clfile }}
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

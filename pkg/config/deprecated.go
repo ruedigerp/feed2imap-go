@@ -8,7 +8,7 @@ import (
 
 type deprecated struct {
 	msg    string
-	handle func(interface{}, *GlobalOptions, *Options)
+	handle func(any, *GlobalOptions, *Options)
 }
 
 var unsupported = deprecated{
@@ -19,11 +19,10 @@ var unsupported = deprecated{
 var deprecatedOpts = map[string]deprecated{
 	"dumpdir":       unsupported,
 	"debug-updated": {"Use '-d' as option instead.", nil},
-	"execurl":       unsupported,
-	"filter":        unsupported,
-	"disable-ssl-verification": {"Interpreted as 'tls-no-verify'.", func(i interface{}, global *GlobalOptions, opts *Options) {
-		val, ok := i.(bool)
-		if ok {
+	"execurl":       {"Use 'exec' instead.", nil},
+	"filter":        {"Use 'item-filter' instead.", nil},
+	"disable-ssl-verification": {"Interpreted as 'tls-no-verify'.", func(i any, global *GlobalOptions, opts *Options) {
+		if val, ok := i.(bool); ok {
 			if val && !opts.NoTLS {
 				// do not overwrite the set NoTLS flag!
 				opts.NoTLS = val
@@ -34,7 +33,7 @@ var deprecatedOpts = map[string]deprecated{
 	}},
 }
 
-func handleDeprecated(option string, value interface{}, feed string, global *GlobalOptions, opts *Options) bool {
+func handleDeprecated(option string, value any, feed string, global *GlobalOptions, opts *Options) bool {
 	dep, ok := deprecatedOpts[option]
 	if !ok {
 		return false

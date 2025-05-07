@@ -1,87 +1,77 @@
 package template
 
 import (
+	_ "embed"
+	"errors"
 	"fmt"
 	html "html/template"
 	"io"
-	"strconv"
-	"strings"
+	"io/fs"
+	"os"
 	text "text/template"
 
 	"github.com/Necoro/feed2imap-go/pkg/log"
 )
 
-type Template interface {
-	Execute(wr io.Writer, data interface{}) error
+type template interface {
+	Execute(wr io.Writer, data any) error
+	Name() string
 }
 
-func must(t Template, err error) Template {
-	if err != nil {
+type Template struct {
+	template
+	useHtml bool
+	dflt    string
+}
+
+//go:embed html.tpl
+var defaultHtmlTpl string
+
+//go:embed text.tpl
+var defaultTextTpl string
+
+var Html = Template{
+	useHtml:  true,
+	dflt:     defaultHtmlTpl,
+	template: html.New("Html").Funcs(funcMap),
+}
+
+var Text = Template{
+	useHtml:  false,
+	dflt:     defaultTextTpl,
+	template: text.New("Text").Funcs(funcMap),
+}
+
+func (tpl *Template) loadDefault() {
+	if err := tpl.load(tpl.dflt); err != nil {
 		panic(err)
 	}
-	return t
 }
 
-func dict(v ...interface{}) map[string]interface{} {
-	dict := make(map[string]interface{})
-	lenv := len(v)
-	for i := 0; i < lenv; i += 2 {
-		key := v[i].(string)
-		if i+1 >= lenv {
-			dict[key] = ""
-			continue
-		}
-		dict[key] = v[i+1]
-	}
-	return dict
-}
-
-func join(sep string, parts []string) string {
-	return strings.Join(parts, sep)
-}
-
-func lastUrlPart(url string) string {
-	split := strings.Split(url, "/")
-	return split[len(split)-1]
-}
-
-func byteCount(str string) string {
-	var b uint64
-	if str != "" {
-		var err error
-		if b, err = strconv.ParseUint(str, 10, 64); err != nil {
-			log.Printf("Cannot convert '%s' to byte count: %s", str, err)
-		}
-	}
-
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := uint64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-func _html(s string) html.HTML {
-	return html.HTML(s)
-}
-
-var funcMap = html.FuncMap{
-	"dict":        dict,
-	"join":        join,
-	"lastUrlPart": lastUrlPart,
-	"byteCount":   byteCount,
-	"html":        _html,
-}
-
-func fromString(name, templateStr string, useHtml bool) Template {
-	if useHtml {
-		return must(html.New(name).Funcs(funcMap).Parse(templateStr))
+func (tpl *Template) load(content string) (err error) {
+	if tpl.useHtml {
+		_, err = tpl.template.(*html.Template).Parse(content)
 	} else {
-		return must(text.New(name).Funcs(text.FuncMap(funcMap)).Parse(templateStr))
+		_, err = tpl.template.(*text.Template).Parse(content)
 	}
+	return
+}
+
+func (tpl *Template) LoadFile(file string) error {
+	content, err := os.ReadFile(file)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Errorf("Template file '%s' does not exist, keeping default.", file)
+			return nil
+		} else {
+			return fmt.Errorf("reading template file '%s': %w", file, err)
+		}
+	}
+
+	return tpl.load(string(content))
+}
+
+func init() {
+	Html.loadDefault()
+	Text.loadDefault()
 }

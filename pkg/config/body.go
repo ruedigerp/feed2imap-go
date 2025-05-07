@@ -2,15 +2,14 @@ package config
 
 import (
 	"fmt"
+	"slices"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/Necoro/feed2imap-go/pkg/util"
 )
 
 type Body string
 
-var validBody = []string{"default", "both", "content", "description"}
+var validBody = []string{"default", "both", "content", "description", "fetch"}
 
 func (b *Body) UnmarshalYAML(node *yaml.Node) error {
 	var val string
@@ -22,7 +21,7 @@ func (b *Body) UnmarshalYAML(node *yaml.Node) error {
 		val = "default"
 	}
 
-	if !util.StrContains(validBody, val) {
+	if !slices.Contains(validBody, val) {
 		return TypeError("line %d: Invalid value for 'body': %q", node.Line, val)
 	}
 
@@ -30,6 +29,6 @@ func (b *Body) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-func TypeError(format string, v ...interface{}) *yaml.TypeError {
+func TypeError(format string, v ...any) *yaml.TypeError {
 	return &yaml.TypeError{Errors: []string{fmt.Sprintf(format, v...)}}
 }

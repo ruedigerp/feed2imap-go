@@ -1,27 +1,55 @@
 # Example configuration. Each configuration option presented shows its default, so sensible.
+# NB: THIS FILE *WILL* INCLUDE IMAP CREDENTIALS. ENSURE SENSIBLE ACCESS RIGHTS!
 
 ## Target
-# The IMAP URI where to put emails, including credentials. Should start with imap:// for IMAP and imaps:// for IMAPS.
-# URI must be properly escaped, thus '@' as part of the user must be written as %40.
-# NB: This also applies for the password!
-# Format: scheme://user:password@host/PATH
-# Host can include a port; PATH denotes the root of the hierarchy for all feeds. Probably should start with INBOX.
-# Allowed delimiters in PATH are '/' -- they will be replaced by the correct delimiter. If you know yours, you can
-# also use that.
-target: imap://test%40example.com:passw0rd@mail.example.com:143/INBOX/Feeds
+target:
+  # scheme: either imap or imaps; if omitted, it is deduced from the port
+  scheme: imap
+  # user
+  user: test@example.com
+  # password
+  password: passw0rd
+  # host, without the port
+  host: mail.example.com
+  # port; optional if scheme is given
+  port: 143
+  # root denotes the root of the hierarchy for all feeds. Probably should start with INBOX, but may also be empty.
+  # The allowed delimiter in the path is either '/' as a default, or the one used by your mailserver, if so known (for
+  # example: '.').
+  root: INBOX/Feeds
+# Instead of the verbose target, specifiying a URI is also legitimate. Be sure to properly url-encode user and password.
+# The example from above would read:
+# target: imap://test%40example.com:passw0rd@mail.example.com:143/INBOX/Feeds
+
+# NB: Instead of specifying the target on the global level, for compatibility with old configurations, it is also allowed
+# to specify the full URL string for each feed.
+# When doing so, _all_ target strings must point to the same server, else an error will be thrown.
+# See https://github.com/Necoro/feed2imap-go/issues/6 for more details.
 
 ## Global Options
+# Location of the cache. Can also be overwritten on the command line.
+cache: "feed.cache"
 # Timeout in seconds for fetching feeds.
 timeout: 30
 # Maximum number of failures allowed before they are reported in normal mode.
 # By default, failures are only visible in verbose mode. Most feeds tend to suffer from temporary failures.
 max-failures:  10
+# Maximum number of concurrent IMAP connections opened.
+max-imap-connections: 5
 # Parts to generate in the resulting emails.
 # Valid parts are "text" and "html"
 parts: ["text", "html"]
+# Overwrite the default template for text/html.
+# See https://github.com/Necoro/feed2imap-go/wiki/Detailed-Options for more information.
+html-template: html.tpl
+text-template: text.tpl
 # Email-Address to use in 'From' and 'To' when not specified in feed.
 # Default uses 'current user'@hostname
 default-email: username@hostname
+# Whether the target folder determination for each feed shall fallback on the feed's/group's name.
+# When `true`, omitting a target is identical to specifying the name as the target.
+# When `false`, omitting a target is identical to specifying `null` or `""` as the target.
+auto-target: true
 
 ## Per-Feed Options
 # Defaults for options per feed, overridable in each feed and group
@@ -44,6 +72,8 @@ options:
   #  - content: Use the 'content' tag
   #  - description: Use the 'description' tag
   #  - both: Use both
+  #  - fetch: Ignore the body delivered by the feed and instead fetch the linked website.
+  #           It may be advisable to set `include-images` to false in that mode to avoid unexpected large mails.
   body: default
   # Disable a feed. Beats commenting ;)
   disable: false
@@ -60,16 +90,26 @@ options:
   # If an item is updated, but has been deleted on the server already, it is re-uploaded when this option is true.
   # Else it is ignored.
   reupload-if-updated: false
+  # Items of a feed may be filtered. In general there is no real use in specifying this globally.
+  # For full information about this feature, visit https://github.com/Necoro/feed2imap-go/wiki/Detailed-Options.
+  item-filter: 'Author.Name != "Weirdo"'
 
 ## Feeds
-# Each feed must have a name and a URL. The name must be unique.
+# Each feed must have a name, and a URL or Exec argument. The name must be unique.
 # The name also determines the folder to use for that feed, which can be overwritten with an explicit target.
+# This behavior can be changed by toggling the global option `auto-target` (see above).
 # Groups can be used to build a hierarchy, with arbitrary nesting.
 feeds:
   - name: XKCD
     url: http://xkcd.com/rss.xml
     # specify any per feed option to overwrite it for this feed
     min-frequency: 12
+    # No target has been defined, so it falls back onto the feed's name.
+    # Combined with the global `target`, the final folder will be:
+    #   INBOX/Feeds/XKCD
+    # Would the global option `auto-target` been set to `false`, this fallback would not occur,
+    # and the final folder would be:
+    #   INBOX/Feeds
   # Groups can be used for, well, grouping.
   - group: Linux
     # You can specify options on group level that are then used for all feeds contained
@@ -81,7 +121,9 @@ feeds:
         # Considering the global `target` the final folder will be:
         #  INBOX/Feeds/Linux/Arch
         target: Arch
-        url: https://www.archlinux.org/feeds/news/
+        # Use `exec` instead of `url` when fetching is not enough and script magic is needed.
+        # See https://github.com/Necoro/feed2imap-go/wiki/Detailed-Options for details.
+        exec: ["wget", "https://www.archlinux.org/feeds/news/", "-O", "-"]
         # Groups can be nested...
       - group: Gentoo
         # and also specify a target (which is superfluous here, because it is identical to the group name)

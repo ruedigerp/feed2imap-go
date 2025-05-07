@@ -2,56 +2,66 @@ package feed
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/Necoro/gofeed"
 	"github.com/google/uuid"
-	"github.com/mmcdole/gofeed"
 
 	"github.com/Necoro/feed2imap-go/pkg/config"
-	"github.com/Necoro/feed2imap-go/pkg/util"
 )
 
 type feedImage struct {
 	image []byte
 	mime  string
+	name  string
 }
 
-type item struct {
-	*gofeed.Item
-	Feed       *gofeed.Feed
-	feed       *Feed
-	Body       string
-	TextBody   string
-	updateOnly bool
-	reasons    []string
-	images     []feedImage
-	itemId     uuid.UUID
+type ItemID uuid.UUID
+
+func newItemID() ItemID {
+	return ItemID(uuid.New())
 }
 
-func (item *item) DateParsed() *time.Time {
+type Item struct {
+	*gofeed.Item              // access fields implicitly
+	Feed         *gofeed.Feed // named explicitly to not shadow common fields with Item
+	feed         *Feed
+	Body         string
+	TextBody     string
+	UpdateOnly   bool
+	ID           ItemID
+	reasons      []string
+	images       []feedImage
+}
+
+func (item *Item) DateParsed() *time.Time {
 	if item.UpdatedParsed == nil || item.UpdatedParsed.IsZero() {
 		return item.PublishedParsed
 	}
 	return item.UpdatedParsed
 }
 
-func (item *item) Date() string {
+func (item *Item) Date() string {
 	if item.Updated == "" {
 		return item.Published
 	}
 	return item.Updated
 }
 
-// Creator returns the name of the creating author.
-func (item *item) Creator() string {
-	if item.Author != nil {
-		return item.Author.Name
+// Creator returns the name of the creating authors (comma separated).
+func (item *Item) Creator() string {
+	names := make([]string, len(item.Authors))
+	for i, p := range item.Authors {
+		names[i] = p.Name
 	}
-	return ""
+	return strings.Join(names, ", ")
 }
 
-func (item *item) FeedLink() string {
+func (item *Item) FeedLink() string {
 	if item.Feed.FeedLink != "" {
 		// the one in the feed itself
 		return item.Feed.FeedLink
@@ -60,31 +70,38 @@ func (item *item) FeedLink() string {
 	return item.feed.Url
 }
 
-func (item *item) addReason(reason string) {
-	if !util.StrContains(item.reasons, reason) {
+func (item *Item) AddReason(reason string) {
+	if !slices.Contains(item.reasons, reason) {
 		item.reasons = append(item.reasons, reason)
 	}
 }
 
-func (item *item) addImage(img []byte, mime string) int {
-	i := feedImage{img, mime}
+func (item *Item) addImage(img []byte, mime string, name string) int {
+	i := feedImage{img, mime, name}
 	item.images = append(item.images, i)
 	return len(item.images)
 }
 
-func (item *item) clearImages() {
+func (item *Item) clearImages() {
+	clear(item.images)
 	item.images = []feedImage{}
 }
 
-func (item *item) defaultEmail() string {
+func (item *Item) defaultEmail() string {
 	return item.feed.Global.DefaultEmail
 }
 
-func (item *item) id() string {
-	idStr := base64.RawURLEncoding.EncodeToString(item.itemId[:])
-	return item.feed.cached.ID() + "#" + idStr
+func (item *Item) Id() string {
+	idStr := base64.RawURLEncoding.EncodeToString(item.ID[:])
+	return item.feed.id() + "#" + idStr
 }
 
-func (item *item) messageId() string {
-	return fmt.Sprintf("<feed#%s@%s>", item.id(), config.Hostname())
+func (item *Item) messageId() string {
+	return fmt.Sprintf("<feed#%s@%s>", item.Id(), config.Hostname())
+}
+
+func printItem(item *gofeed.Item) string {
+	// analogous to gofeed.Feed.String
+	json, _ := json.MarshalIndent(item, "", "    ")
+	return string(json)
 }

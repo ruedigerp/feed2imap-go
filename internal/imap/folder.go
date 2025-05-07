@@ -7,6 +7,10 @@ type Folder struct {
 	delimiter string
 }
 
+func (f Folder) IsBlank() bool {
+	return f.str == ""
+}
+
 func (f Folder) String() string {
 	return f.str
 }
@@ -15,15 +19,35 @@ func (f Folder) Append(other Folder) Folder {
 	if f.delimiter != other.delimiter {
 		panic("Delimiters do not match")
 	}
+
+	if other.str == "" {
+		return f
+	}
+
+	var prefix string
+	if f.str == "" {
+		prefix = ""
+	} else {
+		prefix = f.str + f.delimiter
+	}
+
 	return Folder{
-		str:       f.str + f.delimiter + other.str,
+		str:       prefix + other.str,
 		delimiter: f.delimiter,
 	}
 }
 
+func buildFolderName(path []string, delimiter string) (name string) {
+	name = strings.Join(path, delimiter)
+	if delimiter != "" {
+		name = strings.Trim(name, delimiter[0:1])
+	}
+	return
+}
+
 func (cl *Client) folderName(path []string) Folder {
 	return Folder{
-		strings.Join(path, cl.delimiter),
+		buildFolderName(path, cl.delimiter),
 		cl.delimiter,
 	}
 }

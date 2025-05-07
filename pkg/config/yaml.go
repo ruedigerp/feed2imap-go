@@ -4,18 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"strings"
 
+	"github.com/mitchellh/mapstructure"
 	"gopkg.in/yaml.v3"
 
 	"github.com/Necoro/feed2imap-go/pkg/log"
 )
 
 const (
-	strTag   = "!!str"
-	nullTag  = "!!null"
-	emptyTag = ""
+	strTag  = "!!str"
+	nullTag = "!!null"
 )
 
 type config struct {
@@ -32,6 +31,7 @@ type group struct {
 type feed struct {
 	Name string
 	Url  string
+	Exec []string
 }
 
 type configGroupFeed struct {
@@ -46,20 +46,17 @@ func (grpFeed *configGroupFeed) isGroup() bool {
 }
 
 func (grpFeed *configGroupFeed) isFeed() bool {
-	return grpFeed.Feed.Name != "" || grpFeed.Feed.Url != ""
+	return grpFeed.Feed.Name != "" || grpFeed.Feed.Url != "" || len(grpFeed.Feed.Exec) > 0
 }
 
-func (grpFeed *configGroupFeed) target() string {
-	tag := grpFeed.Target.ShortTag()
-	switch tag {
-	case strTag:
+func (grpFeed *configGroupFeed) target(autoTarget bool) string {
+	if !autoTarget || !grpFeed.Target.IsZero() {
+		if grpFeed.Target.ShortTag() == nullTag {
+			// null may be represented by ~ or NULL or ...
+			// Value would hold this representation, which we do not want
+			return ""
+		}
 		return grpFeed.Target.Value
-	case nullTag:
-		return ""
-	case emptyTag:
-		// tag not set: continue on
-	default:
-		panic("unexpected tag " + tag + " for target node")
 	}
 
 	if grpFeed.Feed.Name != "" {
@@ -121,14 +118,15 @@ func (cfg *Config) parse(in io.Reader) error {
 
 	cfg.fixGlobalOptions(parsedCfg.GlobalConfig)
 
-	if err := buildFeeds(parsedCfg.Feeds, []string{}, cfg.Feeds, &cfg.FeedOptions); err != nil {
-		return fmt.Errorf("while parsing: %w", err)
+	if err := buildFeeds(parsedCfg.Feeds, []string{}, cfg.Feeds, &cfg.FeedOptions, cfg.AutoTarget, &cfg.Target); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 func appTarget(target []string, app string) []string {
+	app = strings.TrimSpace(app)
 	switch {
 	case len(target) == 0 && app == "":
 		return []string{}
@@ -141,55 +139,58 @@ func appTarget(target []string, app string) []string {
 	}
 }
 
-func buildOptions(globalFeedOptions *Options, options Map) (feedOptions Options, unknownFields []string) {
+func buildOptions(globalFeedOptions *Options, options Map) (Options, []string) {
+	// copy global as default
+	feedOptions := *globalFeedOptions
+
 	if options == nil {
 		// no options set for the feed: copy global options and be done
-		return *globalFeedOptions, unknownFields
+		return feedOptions, []string{}
 	}
 
-	fv := reflect.ValueOf(&feedOptions).Elem()
-	gv := reflect.ValueOf(globalFeedOptions).Elem()
-
-	n := gv.NumField()
-	for i := 0; i < n; i++ {
-		val := fv.Field(i)
-		f := fv.Type().Field(i)
-
-		if f.PkgPath != "" && !f.Anonymous {
-			continue
-		}
-
-		tag := f.Tag.Get("yaml")
-		if tag == "" {
-			continue
-		}
-
-		name := strings.Split(tag, ",")[0]
-
-		set, ok := options[name]
-		if ok { // in the map -> copy and delete
-			val.Set(reflect.ValueOf(set))
-			delete(options, name)
-		} else { // not in the map -> copy from global
-			val.Set(gv.Field(i))
-		}
+	var md mapstructure.Metadata
+	mapstructureConfig := mapstructure.DecoderConfig{
+		TagName:  "yaml",
+		Metadata: &md,
+		Result:   &feedOptions,
 	}
 
-	// remaining fields are unknown
-	for k := range options {
-		unknownFields = append(unknownFields, k)
+	var err error
+	dec, err := mapstructure.NewDecoder(&mapstructureConfig)
+	if err != nil {
+		panic(err)
 	}
 
-	return feedOptions, unknownFields
+	err = dec.Decode(options)
+	if err != nil {
+		panic(err)
+	}
+
+	return feedOptions, md.Unused
 }
 
 // Fetch the group structure and populate the `targetStr` fields in the feeds
-func buildFeeds(cfg []configGroupFeed, target []string, feeds Feeds, globalFeedOptions *Options) error {
+func buildFeeds(cfg []configGroupFeed, target []string, feeds Feeds,
+	globalFeedOptions *Options, autoTarget bool, globalTarget *Url) (err error) {
+
 	for _, f := range cfg {
-		target := appTarget(target, f.target())
+		var fTarget []string
+
+		rawTarget := f.target(autoTarget)
+		if isRecognizedUrl(rawTarget) {
+			// deprecated old-style URLs as target
+			// as the full path is specified, `target` is ignored
+			if fTarget, err = handleUrlTarget(rawTarget, &f.Target, globalTarget); err != nil {
+				return err
+			}
+		} else {
+			// new-style tree-like structure
+			fTarget = appTarget(target, rawTarget)
+		}
+
 		switch {
 		case f.isFeed() && f.isGroup():
-			return fmt.Errorf("Entry with targetStr %s is both a Feed and a group", target)
+			return fmt.Errorf("Entry with targetStr %s is both a Feed and a group", fTarget)
 
 		case f.isFeed():
 			name := f.Feed.Name
@@ -198,6 +199,12 @@ func buildFeeds(cfg []configGroupFeed, target []string, feeds Feeds, globalFeedO
 			}
 			if _, ok := feeds[name]; ok {
 				return fmt.Errorf("Duplicate Feed Name '%s'", name)
+			}
+			if len(f.Group.Feeds) > 0 {
+				return fmt.Errorf("Feed '%s' tries to also be a group.", name)
+			}
+			if f.Feed.Url == "" && len(f.Feed.Exec) == 0 {
+				return fmt.Errorf("Feed '%s' has not specified a URL or an Exec clause.", name)
 			}
 
 			opt, unknown := buildOptions(globalFeedOptions, f.Options)
@@ -211,22 +218,54 @@ func buildFeeds(cfg []configGroupFeed, target []string, feeds Feeds, globalFeedO
 			feeds[name] = &Feed{
 				Name:    name,
 				Url:     f.Feed.Url,
+				Exec:    f.Feed.Exec,
 				Options: opt,
-				Target:  target,
+				Target:  fTarget,
 			}
 
 		case f.isGroup():
+			if len(f.Group.Feeds) == 0 {
+				log.Warnf("Group '%s' does not contain any feeds.", f.Group.Group)
+			}
+
 			opt, unknown := buildOptions(globalFeedOptions, f.Options)
 
 			for _, optName := range unknown {
 				log.Warnf("Unknown option '%s' for group '%s'. Ignored!", optName, f.Group.Group)
 			}
 
-			if err := buildFeeds(f.Group.Feeds, target, feeds, &opt); err != nil {
+			if err = buildFeeds(f.Group.Feeds, fTarget, feeds, &opt, autoTarget, globalTarget); err != nil {
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+func handleUrlTarget(targetStr string, targetNode *yaml.Node, globalTarget *Url) ([]string, error) {
+	// this whole function is solely for compatibility with old feed2imap
+	// there it was common to specify the whole URL for each feed
+	if isMaildirUrl(targetStr) {
+		// old feed2imap supported maildir, we don't
+		return nil, fmt.Errorf("Line %d: Maildir is not supported.", targetNode.Line)
+	}
+
+	url := Url{}
+	if err := url.UnmarshalYAML(targetNode); err != nil {
+		return nil, err
+	}
+
+	if globalTarget.Empty() {
+		// assign first feed as global url
+		*globalTarget = url.BaseUrl()
+	} else if !globalTarget.CommonBaseUrl(url) {
+		// if we have a url, it must be the same prefix as the global url
+		return nil, fmt.Errorf("Line %d: Given URL endpoint '%s' does not match previous endpoint '%s'.",
+			targetNode.Line,
+			url.BaseUrl(),
+			globalTarget.BaseUrl())
+	}
+
+	return url.RootPath(), nil
 }

@@ -4,25 +4,29 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"mime"
 	"net/url"
 	"path"
 	"strings"
 	"time"
 
+	"github.com/Necoro/gofeed"
 	"github.com/Necoro/html2text"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/gabriel-vasile/mimetype"
+	"github.com/go-shiori/go-readability"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/charset"
 
 	"github.com/Necoro/feed2imap-go/internal/feed/template"
 	"github.com/Necoro/feed2imap-go/internal/http"
 	"github.com/Necoro/feed2imap-go/internal/msg"
 	"github.com/Necoro/feed2imap-go/pkg/config"
 	"github.com/Necoro/feed2imap-go/pkg/log"
+	"github.com/Necoro/feed2imap-go/pkg/rfc822"
 	"github.com/Necoro/feed2imap-go/pkg/version"
 )
 
@@ -30,26 +34,35 @@ func address(name, address string) []*mail.Address {
 	return []*mail.Address{{Name: name, Address: address}}
 }
 
-func (item *item) fromAddress() []*mail.Address {
+func author(authors []*gofeed.Person) *gofeed.Person {
+	if len(authors) > 0 {
+		return authors[0]
+	}
+	return nil
+}
+
+func (item *Item) fromAddress() []*mail.Address {
+	itemAuthor := author(item.Authors)
+	feedAuthor := author(item.Feed.Authors)
 	switch {
-	case item.Author != nil && item.Author.Email != "":
-		return address(item.Author.Name, item.Author.Email)
-	case item.Author != nil && item.Author.Name != "":
-		return address(item.Author.Name, item.defaultEmail())
-	case item.Feed.Author != nil && item.Feed.Author.Email != "":
-		return address(item.Feed.Author.Name, item.Feed.Author.Email)
-	case item.Feed.Author != nil && item.Feed.Author.Name != "":
-		return address(item.Feed.Author.Name, item.defaultEmail())
+	case itemAuthor != nil && itemAuthor.Email != "":
+		return address(itemAuthor.Name, itemAuthor.Email)
+	case itemAuthor != nil && itemAuthor.Name != "":
+		return address(itemAuthor.Name, item.defaultEmail())
+	case feedAuthor != nil && feedAuthor.Email != "":
+		return address(feedAuthor.Name, feedAuthor.Email)
+	case feedAuthor != nil && feedAuthor.Name != "":
+		return address(feedAuthor.Name, item.defaultEmail())
 	default:
 		return address(item.feed.Name, item.defaultEmail())
 	}
 }
 
-func (item *item) toAddress() []*mail.Address {
+func (item *Item) toAddress() []*mail.Address {
 	return address(item.feed.Name, item.defaultEmail())
 }
 
-func (item *item) buildHeader() message.Header {
+func (item *Item) buildHeader() message.Header {
 	var h mail.Header
 	h.SetContentType("multipart/alternative", nil)
 	h.SetAddressList("From", item.fromAddress())
@@ -57,7 +70,8 @@ func (item *item) buildHeader() message.Header {
 	h.Set("Message-Id", item.messageId())
 	h.Set(msg.VersionHeader, version.Version())
 	h.Set(msg.ReasonHeader, strings.Join(item.reasons, ","))
-	h.Set(msg.IdHeader, item.id())
+	h.Set(msg.IdHeader, item.Id())
+	h.Set(msg.CreateHeader, time.Now().Format(time.RFC1123Z))
 	if item.GUID != "" {
 		h.Set(msg.GuidHeader, item.GUID)
 	}
@@ -84,7 +98,7 @@ func (item *item) buildHeader() message.Header {
 	return h.Header
 }
 
-func (item *item) writeContentPart(w *message.Writer, typ string, tpl template.Template) error {
+func (item *Item) writeContentPart(w *message.Writer, typ string, tpl template.Template) error {
 	var ih message.Header
 	ih.SetContentType("text/"+typ, map[string]string{"charset": "utf-8"})
 	ih.SetContentDisposition("inline", nil)
@@ -96,25 +110,34 @@ func (item *item) writeContentPart(w *message.Writer, typ string, tpl template.T
 	}
 	defer partW.Close()
 
-	if err = tpl.Execute(w, item); err != nil {
+	if err = tpl.Execute(rfc822.Writer(w), item); err != nil {
 		return fmt.Errorf("writing %s part: %w", typ, err)
 	}
 
 	return nil
 }
 
-func (item *item) writeTextPart(w *message.Writer) error {
+func (item *Item) writeTextPart(w *message.Writer) error {
 	return item.writeContentPart(w, "plain", template.Text)
 }
 
-func (item *item) writeHtmlPart(w *message.Writer) error {
+func (item *Item) writeHtmlPart(w *message.Writer) error {
 	return item.writeContentPart(w, "html", template.Html)
+}
+
+func (img *feedImage) buildNameMap(key string) map[string]string {
+	if img.name == "" {
+		return nil
+	}
+	return map[string]string{key: img.name}
 }
 
 func (img *feedImage) writeImagePart(w *message.Writer, cid string) error {
 	var ih message.Header
-	ih.SetContentType(img.mime, nil)
-	ih.SetContentDisposition("inline", nil)
+	// set filename for both Type and Disposition
+	// according to standard, it belongs to the latter -- but some clients expect the former
+	ih.SetContentType(img.mime, img.buildNameMap("name"))
+	ih.SetContentDisposition("inline", img.buildNameMap("filename"))
 	ih.Set("Content-Transfer-Encoding", "base64")
 	ih.SetText("Content-ID", fmt.Sprintf("<%s>", cid))
 
@@ -131,7 +154,7 @@ func (img *feedImage) writeImagePart(w *message.Writer, cid string) error {
 	return nil
 }
 
-func (item *item) writeToBuffer(b *bytes.Buffer) error {
+func (item *Item) writeToBuffer(b *bytes.Buffer) error {
 	h := item.buildHeader()
 	item.buildBody()
 
@@ -176,7 +199,7 @@ func (item *item) writeToBuffer(b *bytes.Buffer) error {
 	return nil
 }
 
-func (item *item) message() (msg.Message, error) {
+func (item *Item) message() (msg.Message, error) {
 	var b bytes.Buffer
 
 	if err := item.writeToBuffer(&b); err != nil {
@@ -185,8 +208,8 @@ func (item *item) message() (msg.Message, error) {
 
 	msg := msg.Message{
 		Content:  b.String(),
-		IsUpdate: item.updateOnly,
-		ID:       item.id(),
+		IsUpdate: item.UpdateOnly,
+		ID:       item.Id(),
 	}
 
 	return msg, nil
@@ -205,14 +228,14 @@ func (feed *Feed) Messages() (msg.Messages, error) {
 	return mails, nil
 }
 
-func getImage(src string, timeout int, disableTLS bool) ([]byte, string, error) {
-	resp, cancel, err := http.Get(src, timeout, disableTLS)
+func getImage(src string, ctx http.Context) ([]byte, string, error) {
+	resp, cancel, err := http.Get(src, ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetching from '%s': %w", src, err)
 	}
 	defer cancel()
 
-	img, err := ioutil.ReadAll(resp.Body)
+	img, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("reading from '%s': %w", src, err)
 	}
@@ -227,43 +250,150 @@ func getImage(src string, timeout int, disableTLS bool) ([]byte, string, error) 
 	return img, mimeStr, nil
 }
 
+func getFullArticle(src string, ctx http.Context) (string, error) {
+	log.Debugf("Fetching article from '%s'", src)
+	resp, cancel, err := http.Get(src, ctx)
+	if err != nil {
+		return "", fmt.Errorf("fetching from '%s': %w", src, err)
+	}
+	defer cancel()
+
+	reader, err := charset.NewReader(resp.Body, resp.Header.Get("Content-Type"))
+	if err != nil {
+		return "", fmt.Errorf("detecting charset from '%s': %w", src, err)
+	}
+
+	doc, err := html.Parse(reader)
+	if err != nil {
+		return "", fmt.Errorf("parsing body from '%s': %w", src, err)
+	}
+
+	article, err := readability.FromDocument(doc, resp.Request.URL)
+	if err != nil {
+		return "", fmt.Errorf("parsing body from '%s': %w", src, err)
+	}
+
+	return article.Content, nil
+}
+
 func cidNr(idx int) string {
 	return fmt.Sprintf("cid_%d", idx)
 }
 
-func getBody(content, description string, bodyCfg config.Body) string {
+func (item *Item) getBody(bodyCfg config.Body) (string, error) {
 	switch bodyCfg {
 	case "default":
-		if content != "" {
-			return content
+		if item.Content != "" {
+			return item.Content, nil
 		}
-		return description
+		return item.Description, nil
 	case "description":
-		return description
+		return item.Description, nil
 	case "content":
-		return content
+		return item.Content, nil
 	case "both":
-		return description + content
+		return item.Description + item.Content, nil
+	case "fetch":
+		return getFullArticle(item.Link, item.feed.Context())
 	default:
-		panic(fmt.Sprintf("Unknown value for Body: %v", bodyCfg))
+		return "", fmt.Errorf("Unknown value for Body: %v", bodyCfg)
 	}
 }
 
-func (item *item) buildBody() {
+func (item *Item) resolveUrl(otherUrlStr string) string {
 	feed := item.feed
-	feedUrl, err := url.Parse(feed.Url)
-	if err != nil {
-		panic(fmt.Sprintf("URL '%s' of feed '%s' is not a valid URL. How have we ended up here?", feed.Url, feed.Name))
+	feedUrl := feed.url()
+
+	if feedUrl == nil {
+		// no url, just return the original
+		return otherUrlStr
 	}
 
-	body := getBody(item.Content, item.Description, feed.Body)
-	bodyNode, err := html.Parse(strings.NewReader(body))
+	otherUrl, err := url.Parse(otherUrlStr)
 	if err != nil {
-		log.Errorf("Feed %s: Item %s: Error while parsing html: %s", feed.Name, item.Link, err)
-		item.Body = body
-		item.TextBody = body
+		log.Errorf("Feed %s: Item %s: Error parsing URL '%s' embedded in item: %s",
+			feed.Name, item.Link, otherUrlStr, err)
+		return ""
+	}
+
+	return feedUrl.ResolveReference(otherUrl).String()
+}
+
+func (item *Item) downloadImage(src string) string {
+	feed := item.feed
+
+	imgUrl := item.resolveUrl(src)
+
+	img, mime, err := getImage(imgUrl, feed.Context())
+	if err != nil {
+		log.Errorf("Feed %s: Item %s: Error fetching image: %s",
+			feed.Name, item.Link, err)
+		return ""
+	}
+	if img == nil {
+		return ""
+	}
+
+	if feed.EmbedImages {
+		return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img)
+	} else {
+		name := path.Base(src)
+		if name == "/" || name == "." || name == " " {
+			name = ""
+		}
+
+		idx := item.addImage(img, mime, name)
+		return "cid:" + cidNr(idx)
+	}
+}
+
+func (item *Item) buildBody() {
+	var err error
+	feed := item.feed
+
+	if item.Body, err = item.getBody(feed.Body); err != nil {
+		log.Errorf("Feed %s: Item %s: Error while fetching body: %s", feed.Name, item.Link, err)
 		return
 	}
+
+	bodyNode, err := html.Parse(strings.NewReader(item.Body))
+	if err != nil {
+		log.Errorf("Feed %s: Item %s: Error while parsing html: %s", feed.Name, item.Link, err)
+		item.TextBody = item.Body
+		return
+	}
+
+	doc := goquery.NewDocumentFromNode(bodyNode)
+	doneAnything := false
+
+	updateBody := func() {
+		if doneAnything {
+			html, err := goquery.OuterHtml(doc.Selection)
+			if err != nil {
+				item.clearImages()
+				log.Errorf("Feed %s: Item %s: Error during rendering HTML: %s",
+					feed.Name, item.Link, err)
+			} else {
+				item.Body = html
+			}
+		}
+	}
+
+	// make relative links absolute
+	doc.Find("a").Each(func(i int, selection *goquery.Selection) {
+		const attr = "href"
+
+		src, ok := selection.Attr(attr)
+		if !ok {
+			return
+		}
+
+		if src != "" && src[0] == '/' {
+			absUrl := item.resolveUrl(src)
+			selection.SetAttr(attr, absUrl)
+			doneAnything = true
+		}
+	})
 
 	if feed.Global.WithPartText() {
 		if item.TextBody, err = html2text.FromHTMLNode(bodyNode, html2text.Options{CitationStyleLinks: true}); err != nil {
@@ -271,16 +401,17 @@ func (item *item) buildBody() {
 		}
 	}
 
-	if !feed.InclImages || !feed.Global.WithPartHtml() || err != nil {
-		item.Body = body
+	if !feed.Global.WithPartHtml() || err != nil {
 		return
 	}
 
-	doc := goquery.NewDocumentFromNode(bodyNode)
+	if !feed.InclImages {
+		updateBody()
+		return
+	}
 
-	doneAnything := true
-	nodes := doc.Find("img")
-	nodes.Each(func(i int, selection *goquery.Selection) {
+	// download images
+	doc.Find("img").Each(func(i int, selection *goquery.Selection) {
 		const attr = "src"
 
 		src, ok := selection.Attr(attr)
@@ -288,45 +419,18 @@ func (item *item) buildBody() {
 			return
 		}
 
-		srcUrl, err := url.Parse(src)
-		if err != nil {
-			log.Errorf("Feed %s: Item %s: Error parsing URL '%s' embedded in item: %s",
-				feed.Name, item.Link, src, err)
-			return
-		}
-		imgUrl := feedUrl.ResolveReference(srcUrl)
-
-		img, mime, err := getImage(imgUrl.String(), feed.Global.Timeout, feed.NoTLS)
-		if err != nil {
-			log.Errorf("Feed %s: Item %s: Error fetching image: %s",
-				feed.Name, item.Link, err)
-			return
-		}
-		if img == nil {
-			return
+		if !strings.HasPrefix(src, "data:") {
+			if imgStr := item.downloadImage(src); imgStr != "" {
+				selection.SetAttr(attr, imgStr)
+			}
 		}
 
-		if feed.EmbedImages {
-			imgStr := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img)
-			selection.SetAttr(attr, imgStr)
-		} else {
-			idx := item.addImage(img, mime)
-			cid := "cid:" + cidNr(idx)
-			selection.SetAttr(attr, cid)
-		}
+		// srcset overrides src and would reload all the images
+		// we do not want to include all images in the srcset either, so just strip it
+		selection.RemoveAttr("srcset")
+
 		doneAnything = true
 	})
 
-	if doneAnything {
-		html, err := doc.Find("body").Html()
-		if err != nil {
-			item.clearImages()
-			log.Errorf("Feed %s: Item %s: Error during rendering HTML: %s",
-				feed.Name, item.Link, err)
-		} else {
-			body = html
-		}
-	}
-
-	item.Body = body
+	updateBody()
 }
